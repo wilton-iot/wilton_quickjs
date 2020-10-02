@@ -45,6 +45,7 @@ namespace quickjs {
 
 namespace { // anonymous
 
+/*
 std::string extract_stacktrace(JSContext* ctx) {
     (void) ctx;
     return "";
@@ -55,7 +56,6 @@ std::string format_stacktrace(JSContext* ctx) {
     return "";
 }
 
-/*
 duk_ret_t load_func(JSContext* ctx) {
     auto path = std::string();
     try {
