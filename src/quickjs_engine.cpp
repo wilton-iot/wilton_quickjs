@@ -40,31 +40,146 @@
 #include "wilton/support/exception.hpp"
 #include "wilton/support/logging.hpp"
 
+#include "quickjs_config.hpp"
+
 namespace wilton {
 namespace quickjs {
 
 namespace { // anonymous
 
-/*
-std::string extract_stacktrace(JSContext* ctx) {
-    (void) ctx;
+const std::string st_prefix = "    at ";
+
+quickjs_config get_config() {
+    char* conf = nullptr;
+    int conf_len = 0;
+    auto err = wilton_config(std::addressof(conf), std::addressof(conf_len));
+    if (nullptr != err) support::throw_wilton_error(err, TRACEMSG(err));
+    auto deferred = sl::support::defer([conf] () STATICLIB_NOEXCEPT {
+        wilton_free(conf);
+    });
+    auto json = sl::json::load({const_cast<const char*>(conf), conf_len});
+    return quickjs_config(json["environmentVariables"]);
+}
+
+void apply_config(JSRuntime* rt, quickjs_config& cfg) {
+    if (cfg.memory_limit_bytes > 0) {
+        JS_SetMemoryLimit(rt, static_cast<size_t>(cfg.memory_limit_bytes)); 
+    }
+    if (cfg.gc_threshold_bytes > 0) {
+        JS_SetGCThreshold(rt, static_cast<size_t>(cfg.gc_threshold_bytes)); 
+    }
+    if (cfg.max_stack_size_bytes > 0) {
+        JS_SetMaxStackSize(rt, static_cast<size_t>(cfg.max_stack_size_bytes)); 
+    }
+}
+
+void register_c_func(JSContext* ctx, const std::string& name, JSCFunction fun, int args_count) {
+    JSValue jfun = JS_NewCFunction(ctx, fun, name.c_str(), args_count);
+    if(!JS_IsFunction(ctx, jfun)) throw support::exception(TRACEMSG(
+            "'JS_NewCFunction' error"));
+    JSValue global = JS_GetGlobalObject(ctx);
+    auto deferred = sl::support::defer([ctx, global]() STATICLIB_NOEXCEPT {
+        JS_FreeValue(ctx, global);
+    });
+    auto res_code = JS_SetPropertyStr(ctx, global, name.c_str(), jfun);
+    if(!res_code) throw support::exception(TRACEMSG(
+            "'JS_SetPropertyStr' error"));
+}
+
+std::string jsval_to_string(JSContext* ctx, JSValue val) STATICLIB_NOEXCEPT {
+    size_t len = 0;
+    auto cst = JS_ToCStringLen(ctx, std::addressof(len), val);
+    if (nullptr == cst || 0 == len) {
+        return "";
+    }
+    auto deferred = sl::support::defer([ctx, cst]() STATICLIB_NOEXCEPT {
+        JS_FreeCString(ctx, cst);
+    });
+    return std::string(cst, len);
+}
+
+std::string format_stack_trace(JSContext* ctx) {
+    JSValue exc_val = JS_GetException(ctx);
+    auto exc_deferred = sl::support::defer([ctx, exc_val]() STATICLIB_NOEXCEPT {
+        JS_FreeValue(ctx, exc_val);
+    });
+    if(JS_IsObject(exc_val)) {
+        JSValue msg_val = JS_GetPropertyStr(ctx, exc_val, "message");
+        auto msg_deferred = sl::support::defer([ctx, msg_val]() STATICLIB_NOEXCEPT {
+            JS_FreeValue(ctx, msg_val);
+        });
+        if (JS_IsString(msg_val)) {
+            auto msg = jsval_to_string(ctx, msg_val);
+            JSValue stack_val = JS_GetPropertyStr(ctx, exc_val, "stack");
+            auto stack_deferred = sl::support::defer([ctx, stack_val]() STATICLIB_NOEXCEPT {
+                JS_FreeValue(ctx, stack_val);
+            });
+            if (JS_IsString(stack_val)) {
+                auto stack = jsval_to_string(ctx, stack_val);
+                auto full = msg + "\n" + stack;
+                auto vec = sl::utils::split(full, '\n');
+                auto res = std::string();
+                for (size_t i = 0; i < vec.size(); i++) {
+                    auto& line = vec.at(i);
+                    if (line.length() > 1 && !(std::string::npos != line.find("wilton-requirejs/require.js:")) &&
+                            !(std::string::npos != line.find("wilton-require.js:")) &&
+                            !(std::string::npos != line.find("apply (native)"))) {
+                        if (i > 1 && !sl::utils::starts_with(line, st_prefix) &&
+                                (std::string::npos != line.find("(native)") ||
+                                std::string::npos != line.find(".js:"))) {
+                            res += st_prefix;
+                        }
+                        res += line;
+                        res.push_back('\n');
+                    }
+                }
+                if (res.length() > 0 && '\n' == res.back()) {
+                    res.pop_back();
+                }
+                return res;
+            }
+        }
+    }
+    return jsval_to_string(ctx, exc_val);
+}
+
+std::string eval_js(JSContext* ctx, const char* code, size_t code_len, const std::string& path) {
+    JSValue res = JS_Eval(ctx, code, code_len, path.c_str(), 0);
+    if (JS_IsException(res)) {
+        throw support::exception(TRACEMSG(format_stack_trace(ctx)));
+    }
+    if (JS_IsString(res)) {
+        return jsval_to_string(ctx, res);
+    }
     return "";
 }
 
-std::string format_stacktrace(JSContext* ctx) {
-    (void) ctx;
-    return "";
+JSValue throw_js_error(JSContext* ctx, const std::string& msg) {
+    JSValue jmsg = JS_NewStringLen(ctx, msg.c_str(), msg.length());
+    JSValue err = JS_NewError(ctx);
+    JS_SetPropertyStr(ctx, err, "message", jmsg);
+    return JS_Throw(ctx, err);
 }
 
-duk_ret_t load_func(JSContext* ctx) {
+JSValue print_func(JSContext* ctx, JSValueConst /* this_val */,
+        int args_count, JSValueConst* arguments) STATICLIB_NOEXCEPT {
+    if (args_count > 0) {
+        auto val = jsval_to_string(ctx, arguments[0]);
+        puts(val.c_str());
+    } else {
+        puts("");
+    }
+    return JS_UNDEFINED;
+}
+
+JSValue load_func(JSContext* ctx, JSValueConst /* this_val */,
+        int args_count, JSValueConst* arguments) STATICLIB_NOEXCEPT {
     auto path = std::string();
     try {
-        size_t path_len;
-        const char* path_ptr = duk_get_lstring(ctx, 0, std::addressof(path_len));
-        if (nullptr == path_ptr) {
+        if (args_count < 1 || !JS_IsString(arguments[0])) {
             throw support::exception(TRACEMSG("Invalid arguments specified"));
         }
-        path = std::string(path_ptr, path_len);
+        path = jsval_to_string(ctx, arguments[0]);
         // load code
         char* code = nullptr;
         int code_len = 0;
@@ -73,170 +188,129 @@ duk_ret_t load_func(JSContext* ctx) {
         if (nullptr != err_load) {
             support::throw_wilton_error(err_load, TRACEMSG(err_load));
         }
-        if (0 == code_len) {
-            throw support::exception(TRACEMSG(
-                    "\nInvalid empty source code loaded, path: [" + path + "]").c_str());
-        }
+        auto deferred = sl::support::defer([code] () STATICLIB_NOEXCEPT {
+            wilton_free(code);
+        });
+        auto path_short = support::script_engine_map_detail::shorten_script_path(path);
         wilton::support::log_debug("wilton.engine.quickjs.eval",
                 "Evaluating source file, path: [" + path + "] ...");
-
-        // compile source
-        auto path_short = support::script_engine_map_detail::shorten_script_path(path);
-        wilton::support::log_debug("wilton.engine.quickjs.eval", "loaded file short path: [" + path_short + "]");
-
-        duk_push_lstring(ctx, code, code_len);
-        wilton_free(code);
-        duk_push_lstring(ctx, path_short.c_str(), path_short.length());
-        auto err = duk_pcompile(ctx, DUK_COMPILE_EVAL);
-        if (DUK_EXEC_SUCCESS == err) {
-            err = duk_pcall(ctx, 0);
-        }
-
-        if (DUK_EXEC_SUCCESS != err) {
-            std::string msg = format_stacktrace(ctx);
-            duk_pop(ctx);
-            throw support::exception(TRACEMSG(msg + "\nCall error"));
-        } else {
-            wilton::support::log_debug("wilton.engine.quickjs.eval", "Eval complete");
-            duk_pop(ctx);
-            duk_push_true(ctx);
-        }
-
-        return 1;
+        eval_js(ctx, code, static_cast<size_t>(code_len), path_short);
+        wilton::support::log_debug("wilton.engine.quickjs.eval", "Eval complete");
     } catch (const std::exception& e) {
-        throw support::exception(TRACEMSG(e.what() + 
-                "\nError loading script, path: [" + path + "]").c_str());
+        auto msg = TRACEMSG(e.what() + "\nError loading script, path: [" + path + "]");
+        return throw_js_error(ctx, msg);
     } catch (...) {
-        throw support::exception(TRACEMSG(
-                "Error(...) loading script, path: [" + path + "]").c_str());
+        auto msg = TRACEMSG("Error(...) loading script, path: [" + path + "]");
+        return throw_js_error(ctx, msg);
     }
+    return JS_UNDEFINED;
 }
 
-duk_ret_t wiltoncall_func(JSContext* ctx) {
-    size_t name_len;
-    const char* name = duk_get_lstring(ctx, 0, std::addressof(name_len));
-    if (nullptr == name) {
-        name = "";
-        name_len = 0;
+JSValue wiltoncall_func(JSContext* ctx, JSValueConst /* this_val */,
+        int args_count, JSValueConst* arguments) STATICLIB_NOEXCEPT {
+    if (args_count < 2 || !JS_IsString(arguments[0]) || !JS_IsString(arguments[1])) {
+        auto msg = TRACEMSG("Invalid arguments specified");
+        return throw_js_error(ctx, msg);
     }
-    size_t input_len;
-    const char* input = duk_get_lstring(ctx, 1, std::addressof(input_len));
-    if (nullptr == input) {
-        input = "";
-        input_len = 0;
-    }
+    auto name = jsval_to_string(ctx, arguments[0]);
+    auto input = jsval_to_string(ctx, arguments[1]);
     char* out = nullptr;
     int out_len = 0;
-    wilton::support::log_debug(std::string("wilton.wiltoncall.") + name,
-            "Performing a call, input length: [" + sl::support::to_string(input_len) + "] ...");
-    auto err = wiltoncall(name, static_cast<int> (name_len), input, static_cast<int> (input_len),
+    wilton::support::log_debug("wilton.wiltoncall." + name,
+            "Performing a call, input length: [" + sl::support::to_string(input.length()) + "] ...");
+    auto err = wiltoncall(name.c_str(), static_cast<int> (name.length()),
+            input.c_str(), static_cast<int> (input.length()),
             std::addressof(out), std::addressof(out_len));
-    wilton::support::log_debug(std::string("wilton.wiltoncall.") + name,
+    wilton::support::log_debug("wilton.wiltoncall." + name,
             "Call complete, result: [" + (nullptr != err ? std::string(err) : "") + "]");
     if (nullptr == err) {
         if (nullptr != out) {
-            duk_push_lstring(ctx, out, out_len);
-            wilton_free(out);
+            auto out_deferred = sl::support::defer([out]() STATICLIB_NOEXCEPT {
+                wilton_free(out);
+            });
+            return JS_NewStringLen(ctx, out, static_cast<size_t>(out_len));
         } else {
-            duk_push_null(ctx);
+            return JS_NULL;
         }
-        return 1;
     } else {
+        auto err_deferred = sl::support::defer([err]() STATICLIB_NOEXCEPT {
+            wilton_free(err);
+        });
         auto msg = TRACEMSG(err + "\n'wiltoncall' error for name: [" + name + "]");
-        wilton_free(err);
-        throw support::exception(msg);
+        return throw_js_error(ctx, msg);
     }
 }
-
-void register_c_func(JSContext* ctx, const std::string& name, duk_c_function fun, duk_idx_t argnum) {
-    duk_push_global_object(ctx);
-    duk_push_c_function(ctx, fun, argnum);
-    duk_put_prop_string(ctx, -2, name.c_str());
-    duk_pop(ctx);
-}
-
-void eval_js(JSContext* ctx, const char* code, size_t code_len) {
-    auto err = duk_peval_lstring(ctx, code, code_len);
-    if (DUK_EXEC_SUCCESS != err) {
-        // cannot happen - c++ exception will be thrown by quickjs
-        throw support::exception(TRACEMSG(format_stacktrace(ctx) +
-                "\nDuktape engine eval error"));
-    }
-}
- */
 
 } // namespace
 
 class quickjs_engine::impl : public sl::pimpl::object::impl {
-//    std::unique_ptr<JSContext, std::function<void(JSContext*)>> dukctx;
+    std::unique_ptr<JSRuntime, std::function<void(JSRuntime*)>> jsruntime;
+    std::unique_ptr<JSContext, std::function<void(JSContext*)>> jsctx;
 
 public:
-    impl(sl::io::span<const char> init_code) {
-        wilton::support::log_info("wilton.engine.quickjs.init", "Initializing engine instance ...");
-        /*
-        auto ctx = dukctx.get();
-        if (nullptr == ctx) throw support::exception(TRACEMSG(
-                "Error creating Duktape context"));
-        auto def = sl::support::defer([ctx]() STATICLIB_NOEXCEPT {
-            pop_stack(ctx);
-        });
+    impl(sl::io::span<const char> init_code) :
+    jsruntime(JS_NewRuntime(), JS_FreeRuntime),
+    jsctx(JS_NewContext(this->jsruntime.get()), JS_FreeContext) {
+        auto cfg = get_config();
+        wilton::support::log_info("wilton.engine.quickjs.init", std::string() + "Initializing engine instance," +
+                " config: [" + cfg.to_json().dumps() + "]");
+        auto rt = this->jsruntime.get();
+        if (nullptr == rt) {
+            throw support::exception(TRACEMSG("'JS_NewRuntime' error"));
+        }
+        apply_config(rt, cfg);
+        auto ctx = this->jsctx.get();
+        if (nullptr == ctx) {
+            throw support::exception(TRACEMSG("'JS_NewContext' error"));
+        }
+        register_c_func(ctx, "print", print_func, 1);
         register_c_func(ctx, "WILTON_load", load_func, 1);
         register_c_func(ctx, "WILTON_wiltoncall", wiltoncall_func, 2);
-        eval_js(ctx, init_code.data(), init_code.size());
+        eval_js(ctx, init_code.data(), init_code.size(), "wilton-require.js");
         wilton::support::log_info("wilton.engine.quickjs.init", "Engine initialization complete");
-
-        // if debug port specified - run debugging
-        if (debug_transport.is_active()) {
-
-            wilton::support::log_debug("wilton.engine.quickjs.init",
-                    "port: [" + sl::support::to_string(debug_transport.get_port()) + "]");
-            // create transport protocol handler
-            debug_transport.duk_trans_socket_init();
-            debug_transport.duk_trans_socket_waitconn();
-            duk_debugger_attach(ctx,
-                    duk_trans_socket_read_cb,
-                    duk_trans_socket_write_cb,
-                    duk_trans_socket_peek_cb,
-                    NULL, // read_flush_cb
-                    NULL, // write_flush_cb
-                    NULL, // detach handler
-                    static_cast<void*> (std::addressof(debug_transport))); // udata
-        }
-        */
-        (void) init_code;
     }
 
     support::buffer run_callback_script(quickjs_engine&, sl::io::span<const char> callback_script_json) {
-        /*
-        auto ctx = dukctx.get();
-        auto def = sl::support::defer([ctx]() STATICLIB_NOEXCEPT {
-            pop_stack(ctx);
-        });
-
-        wilton::support::log_debug("wilton.engine.quickjs.run", 
-                "Running callback script: [" + std::string(callback_script_json.data(), callback_script_json.size()) + "] ...");
-        duk_get_global_string(ctx, "WILTON_run");
-        
-        duk_push_lstring(ctx, callback_script_json.data(), callback_script_json.size());
-        auto err = duk_pcall(ctx, 1);
-
         wilton::support::log_debug("wilton.engine.quickjs.run",
-                "Callback run complete, result: [" + sl::support::to_string_bool(DUK_EXEC_SUCCESS == err) + "]");
-        if (DUK_EXEC_SUCCESS != err) {
-            throw support::exception(TRACEMSG(format_stacktrace(ctx)));
+                "Running callback script: [" + std::string(callback_script_json.data(), callback_script_json.size()) + "] ...");
+        auto ctx = jsctx.get();
+        // extract wilton_run
+        JSValue global = JS_GetGlobalObject(ctx);
+        auto global_deferred = sl::support::defer([ctx, global]() STATICLIB_NOEXCEPT {
+            JS_FreeValue(ctx, global);
+        });
+        if (!JS_IsObject(global)) throw support::exception(TRACEMSG(
+                "Error accessing 'WILTON_run' function: not an object"));
+        JSValue wilton_run = JS_GetPropertyStr(ctx, global, "WILTON_run");
+        auto wilton_run_deferred = sl::support::defer([ctx, wilton_run]() STATICLIB_NOEXCEPT {
+            JS_FreeValue(ctx, wilton_run);
+        });
+        if (!JS_IsFunction(ctx, wilton_run)) throw support::exception(TRACEMSG(
+                "Error accessing 'WILTON_run' function: not a function"));
+        // call
+        JSValueConst jcb = JS_NewStringLen(ctx, callback_script_json.data(), callback_script_json.size());
+        auto cb_deferred = sl::support::defer([ctx, jcb]() STATICLIB_NOEXCEPT {
+            JS_FreeValue(ctx, jcb);
+        });
+        // todo: this
+        JSValue res = JS_Call(ctx, wilton_run, global, 1, std::addressof(jcb));
+        auto res_deferred = sl::support::defer([ctx, res]() STATICLIB_NOEXCEPT {
+            JS_FreeValue(ctx, res);
+        });
+        wilton::support::log_debug("wilton.engine.jsc.run",
+                "Callback run complete, result: [" + sl::support::to_string_bool(!JS_IsException(res)) + "]");
+        if (JS_IsException(res)) {
+            throw support::exception(TRACEMSG(format_stack_trace(ctx)));
         }
-        if (DUK_TYPE_STRING == duk_get_type(ctx, -1)) {
-            size_t len;
-            const char* str = duk_get_lstring(ctx, -1, std::addressof(len));            
-            return support::make_array_buffer(str, static_cast<int> (len));            
+        if (JS_IsString(res)) {
+            auto str = jsval_to_string(ctx, res);
+            return support::make_string_buffer(str);
         }
-         */
-        (void) callback_script_json;
         return support::make_null_buffer();
-
     } 
 
     void run_garbage_collector(quickjs_engine&) {
+        JS_RunGC(jsruntime.get());
     }
 };
 
