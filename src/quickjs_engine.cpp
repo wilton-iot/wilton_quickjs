@@ -312,11 +312,18 @@ public:
     void run_garbage_collector(quickjs_engine&) {
         JS_RunGC(jsruntime.get());
     }
+
+    static void initialize() {
+        auto err = JS_StaticlibInitialize();
+        if (0 != err) throw support::exception(TRACEMSG(
+                "Error initializing QuickJS shared library, code: [" + sl::support::to_string(err) + "]"));
+    }
 };
 
 PIMPL_FORWARD_CONSTRUCTOR(quickjs_engine, (sl::io::span<const char>), (), support::exception)
 PIMPL_FORWARD_METHOD(quickjs_engine, support::buffer, run_callback_script, (sl::io::span<const char>), (), support::exception)
 PIMPL_FORWARD_METHOD(quickjs_engine, void, run_garbage_collector, (), (), support::exception)
+PIMPL_FORWARD_METHOD_STATIC(quickjs_engine, void, initialize, (), (), support::exception)
 
 
 } // namespace

@@ -65,6 +65,7 @@ void clean_tls(void*, const char* thread_id, int thread_id_len) {
 
 extern "C" char* wilton_module_init() {
     try {
+        wilton::quickjs::quickjs_engine::initialize();
         wilton::quickjs::shared_tlmap();
         auto err = wilton_register_tls_cleaner(nullptr, wilton::quickjs::clean_tls);
         if (nullptr != err) wilton::support::throw_wilton_error(err, TRACEMSG(err));
