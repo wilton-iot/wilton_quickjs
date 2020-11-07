@@ -302,9 +302,9 @@ JSModuleDef* module_loader(JSContext *ctx, const char* module_name, void* /* opa
         auto deferred_meta = sl::support::defer([ctx, meta] () STATICLIB_NOEXCEPT {
             JS_FreeValue(ctx, meta);
         });
-        JS_DefinePropertyValueStr(ctx, meta, "url", JS_NewString(ctx, path.c_str()), JS_PROP_C_W_E);
+        JS_DefinePropertyValueStr(ctx, meta, "url", JS_NewStringLen(ctx, path.c_str(), path.length()), JS_PROP_C_W_E);
         auto mod_id = module_id(path, module_name);
-        JS_DefinePropertyValueStr(ctx, meta, "id", JS_NewString(ctx, mod_id .c_str()), JS_PROP_C_W_E);
+        JS_DefinePropertyValueStr(ctx, meta, "id", JS_NewStringLen(ctx, mod_id.c_str(), path.length()), JS_PROP_C_W_E);
         JS_DefinePropertyValueStr(ctx, meta, "args", JS_NewArray(ctx), JS_PROP_C_W_E);
 
         return mod;
@@ -374,15 +374,15 @@ JSValueConst run_es_module(JSContext* ctx, const sl::json::value& cb_json_obj) {
     auto deferred_meta = sl::support::defer([ctx, meta] () STATICLIB_NOEXCEPT {
         JS_FreeValue(ctx, meta);
     });
-    JS_DefinePropertyValueStr(ctx, meta, "url", JS_NewString(ctx, path.c_str()), JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, meta, "url", JS_NewStringLen(ctx, path.c_str(), path.length()), JS_PROP_C_W_E);
     auto mod_id = module_id(path, path);
-    JS_DefinePropertyValueStr(ctx, meta, "id", JS_NewString(ctx, mod_id.c_str()), JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, meta, "id", JS_NewStringLen(ctx, mod_id.c_str(), path.length()), JS_PROP_C_W_E);
     JSValue args = JS_NewArray(ctx);
     if (JS_IsException(args)) {
         throw support::exception(TRACEMSG("'JS_NewArray' error"));
     }
     auto& args_json = cb_json_obj["args"].as_array();
-    for (size_t i = 0; i < args_json.size(); i++) {
+    for (uint32_t i = 0; i < args_json.size(); i++) {
         auto& ar = args_json[i];
         if (sl::json::type::string != ar.json_type() && sl::json::type::nullt != ar.json_type()) {
             throw support::exception(TRACEMSG("Invalid callback script argument specified," +
@@ -390,7 +390,7 @@ JSValueConst run_es_module(JSContext* ctx, const sl::json::value& cb_json_obj) {
                     " only string arguments can be passed to ES module callbacks"));
         }
         auto& val = ar.as_string();
-        JSValue el = JS_NewString(ctx, val.c_str());
+        JSValue el = JS_NewStringLen(ctx, val.c_str(), val.length());
         auto ret = JS_DefinePropertyValueUint32(ctx, args, i, el, JS_PROP_C_W_E);
         if (ret < 0) {
             JS_FreeValue(ctx, args);
