@@ -249,6 +249,17 @@ JSValue wiltoncall_func(JSContext* ctx, JSValueConst /* this_val */,
     }
 }
 
+std::string module_id(const std::string& path, const std::string& default_val) {
+    auto mod_id = std::string(default_val);
+    for (auto& fi : wilton_config_json()["requireJs"]["paths"].as_object()) {
+        if (sl::utils::starts_with(path, fi.val().as_string())) {
+            mod_id = fi.name() + "/" + path.substr(fi.val().as_string().length());
+            break;
+        }
+    }
+    return mod_id;
+} 
+
 JSModuleDef* module_loader(JSContext *ctx, const char* module_name, void* /* opaque */) {
     auto path = std::string(module_name);
     if (!(sl::utils::starts_with(path, "file://") || sl::utils::starts_with(path, "zip://"))) {
@@ -264,18 +275,39 @@ JSModuleDef* module_loader(JSContext *ctx, const char* module_name, void* /* opa
         if (nullptr != err_load) {
             support::throw_wilton_error(err_load, TRACEMSG(err_load));
         }
-        auto deferred = sl::support::defer([code] () STATICLIB_NOEXCEPT {
+        auto deferred_code = sl::support::defer([code] () STATICLIB_NOEXCEPT {
             wilton_free(code);
         });
 
-        JSValue func_val = JS_Eval(ctx, code, code_len, path.c_str(),
+        // compile module code
+        wilton::support::log_debug("wilton.engine.quickjs.module_loader",
+                "Loading ES module file, path: [" + path + "] ...");
+        JSValue func = JS_Eval(ctx, code, code_len, path.c_str(),
                 JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
-        if (JS_IsException(func_val)) {
+        wilton::support::log_debug("wilton.engine.quickjs.module_loader",
+                "Load complete, result: [" + (JS_IsException(func) ? std::string("error") : "") + "]");
+        if (JS_IsException(func)) {
             return nullptr;
         }
-        JSModuleDef* res = static_cast<JSModuleDef*>(JS_VALUE_GET_PTR(func_val));
-        JS_FreeValue(ctx, func_val);
-        return res;
+        auto deferred_func = sl::support::defer([ctx, func] () STATICLIB_NOEXCEPT {
+            JS_FreeValue(ctx, func);
+        });
+        JSModuleDef* mod = static_cast<JSModuleDef*>(JS_VALUE_GET_PTR(func));
+
+        // setup import.meta
+        JSValue meta = JS_GetImportMeta(ctx, mod);
+        if (JS_IsException(meta)){
+            return nullptr; 
+        }
+        auto deferred_meta = sl::support::defer([ctx, meta] () STATICLIB_NOEXCEPT {
+            JS_FreeValue(ctx, meta);
+        });
+        JS_DefinePropertyValueStr(ctx, meta, "url", JS_NewString(ctx, path.c_str()), JS_PROP_C_W_E);
+        auto mod_id = module_id(path, module_name);
+        JS_DefinePropertyValueStr(ctx, meta, "id", JS_NewString(ctx, mod_id .c_str()), JS_PROP_C_W_E);
+        JS_DefinePropertyValueStr(ctx, meta, "args", JS_NewArray(ctx), JS_PROP_C_W_E);
+
+        return mod;
     } catch (const std::exception& e) {
         auto msg = TRACEMSG(e.what() + "\nError loading module, path: [" + path + "]");
         throw_js_error(ctx, msg);
@@ -285,6 +317,90 @@ JSModuleDef* module_loader(JSContext *ctx, const char* module_name, void* /* opa
         throw_js_error(ctx, msg);
         return nullptr;
     }
+}
+
+JSValue run_requirejs_module(JSContext* ctx, sl::io::span<const char> callback_script_json) {
+    // extract wilton_run
+    JSValue global = JS_GetGlobalObject(ctx);
+    auto global_deferred = sl::support::defer([ctx, global]() STATICLIB_NOEXCEPT {
+        JS_FreeValue(ctx, global);
+    });
+    if (!JS_IsObject(global)) throw support::exception(TRACEMSG(
+            "Error accessing 'WILTON_run' function: not an object"));
+    JSValue wilton_run = JS_GetPropertyStr(ctx, global, "WILTON_run");
+    auto wilton_run_deferred = sl::support::defer([ctx, wilton_run]() STATICLIB_NOEXCEPT {
+        JS_FreeValue(ctx, wilton_run);
+    });
+    if (!JS_IsFunction(ctx, wilton_run)) throw support::exception(TRACEMSG(
+            "Error accessing 'WILTON_run' function: not a function"));
+    // call
+    JSValueConst jcb = JS_NewStringLen(ctx, callback_script_json.data(), callback_script_json.size());
+    auto cb_deferred = sl::support::defer([ctx, jcb]() STATICLIB_NOEXCEPT {
+        JS_FreeValue(ctx, jcb);
+    });
+    return JS_Call(ctx, wilton_run, global, 1, std::addressof(jcb));
+}
+
+JSValueConst run_es_module(JSContext* ctx, const sl::json::value& cb_json_obj) {
+    // load code
+    auto path = cb_json_obj["esmodule"].as_string_nonempty_or_throw("esmodule");
+    char* code = nullptr;
+    int code_len = 0;
+    auto err_load = wilton_load_resource(path.c_str(), static_cast<int>(path.length()),
+            std::addressof(code), std::addressof(code_len));
+    if (nullptr != err_load) {
+        support::throw_wilton_error(err_load, TRACEMSG(err_load));
+    }
+    auto deferred = sl::support::defer([code] () STATICLIB_NOEXCEPT {
+        wilton_free(code);
+    });
+
+    // compile module
+    JSValue func = JS_Eval(ctx, code, code_len, path.c_str(), JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    if (JS_IsException(func)) {
+        throw support::exception(TRACEMSG(format_stack_trace(ctx)));
+    }
+    // don't need to free it for some reason, crash otherwise
+    //auto deferred_func = sl::support::defer([ctx, func] () STATICLIB_NOEXCEPT {
+    //    JS_FreeValue(ctx, func);
+    //});
+    JSModuleDef* mod = static_cast<JSModuleDef*>(JS_VALUE_GET_PTR(func));
+
+    // setup import.meta
+    JSValue meta = JS_GetImportMeta(ctx, mod);
+    if (JS_IsException(meta)) {
+        throw support::exception(TRACEMSG("'JS_GetImportMeta' error"));
+    }
+    auto deferred_meta = sl::support::defer([ctx, meta] () STATICLIB_NOEXCEPT {
+        JS_FreeValue(ctx, meta);
+    });
+    JS_DefinePropertyValueStr(ctx, meta, "url", JS_NewString(ctx, path.c_str()), JS_PROP_C_W_E);
+    auto mod_id = module_id(path, path);
+    JS_DefinePropertyValueStr(ctx, meta, "id", JS_NewString(ctx, mod_id.c_str()), JS_PROP_C_W_E);
+    JSValue args = JS_NewArray(ctx);
+    if (JS_IsException(args)) {
+        throw support::exception(TRACEMSG("'JS_NewArray' error"));
+    }
+    auto& args_json = cb_json_obj["args"].as_array();
+    for (size_t i = 0; i < args_json.size(); i++) {
+        auto& ar = args_json[i];
+        if (sl::json::type::string != ar.json_type() && sl::json::type::nullt != ar.json_type()) {
+            throw support::exception(TRACEMSG("Invalid callback script argument specified," +
+                    " type: [" + sl::json::stringify_json_type(ar.json_type()) + "],"
+                    " only string arguments can be passed to ES module callbacks"));
+        }
+        auto& val = ar.as_string();
+        JSValue el = JS_NewString(ctx, val.c_str());
+        auto ret = JS_DefinePropertyValueUint32(ctx, args, i, el, JS_PROP_C_W_E);
+        if (ret < 0) {
+            JS_FreeValue(ctx, args);
+            throw support::exception(TRACEMSG("'JS_DefinePropertyValueUint32' error"));
+        }
+    }
+    JS_DefinePropertyValueStr(ctx, meta, "args", args, JS_PROP_C_W_E);
+
+    // run module
+    return JS_EvalFunction(ctx, func);
 }
 
 } // namespace
@@ -321,42 +437,12 @@ public:
         wilton::support::log_debug("wilton.engine.quickjs.run",
                 "Running callback script: [" + std::string(callback_script_json.data(), callback_script_json.size()) + "] ...");
         auto ctx = jsctx.get();
-        auto cb_obj = sl::json::load(callback_script_json);
+        auto cb_json_obj = sl::json::load(callback_script_json);
         JSValue res = JS_UNDEFINED;
-        if ("es" == cb_obj["modtype"].as_string()) {
-            // load code and run
-            auto path = cb_obj["module"].as_string_nonempty_or_throw("module");
-            char* code = nullptr;
-            int code_len = 0;
-            auto err_load = wilton_load_resource(path.c_str(), static_cast<int>(path.length()),
-                    std::addressof(code), std::addressof(code_len));
-            if (nullptr != err_load) {
-                support::throw_wilton_error(err_load, TRACEMSG(err_load));
-            }
-            auto deferred = sl::support::defer([code] () STATICLIB_NOEXCEPT {
-                wilton_free(code);
-            });
-            res = JS_Eval(ctx, code, code_len, path.c_str(), JS_EVAL_TYPE_MODULE);
+        if (!cb_json_obj["esmodule"].as_string().empty()) {
+            res = run_es_module(ctx, cb_json_obj);
         } else {
-            // extract wilton_run
-            JSValue global = JS_GetGlobalObject(ctx);
-            auto global_deferred = sl::support::defer([ctx, global]() STATICLIB_NOEXCEPT {
-                JS_FreeValue(ctx, global);
-            });
-            if (!JS_IsObject(global)) throw support::exception(TRACEMSG(
-                    "Error accessing 'WILTON_run' function: not an object"));
-            JSValue wilton_run = JS_GetPropertyStr(ctx, global, "WILTON_run");
-            auto wilton_run_deferred = sl::support::defer([ctx, wilton_run]() STATICLIB_NOEXCEPT {
-                JS_FreeValue(ctx, wilton_run);
-            });
-            if (!JS_IsFunction(ctx, wilton_run)) throw support::exception(TRACEMSG(
-                    "Error accessing 'WILTON_run' function: not a function"));
-            // call
-            JSValueConst jcb = JS_NewStringLen(ctx, callback_script_json.data(), callback_script_json.size());
-            auto cb_deferred = sl::support::defer([ctx, jcb]() STATICLIB_NOEXCEPT {
-                JS_FreeValue(ctx, jcb);
-            });
-            res = JS_Call(ctx, wilton_run, global, 1, std::addressof(jcb));
+            res = run_requirejs_module(ctx, callback_script_json);
         }
         auto res_deferred = sl::support::defer([ctx, res]() STATICLIB_NOEXCEPT {
             JS_FreeValue(ctx, res);
