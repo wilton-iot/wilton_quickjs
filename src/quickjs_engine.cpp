@@ -273,7 +273,7 @@ JSValue create_arg_val(JSContext* ctx, const sl::json::value& ar) {
     case sl::json::type::nullt:
         return JS_NULL;
     case sl::json::type::string:
-        return JS_NewString(ctx, ar.as_string().c_str());
+        return JS_NewStringLen(ctx, ar.as_string().c_str(), ar.as_string().length());
     case sl::json::type::integer:
         return JS_NewInt64(ctx, ar.as_int64());
     case sl::json::type::boolean:
