@@ -260,11 +260,39 @@ std::string module_id(const std::string& path, const std::string& default_val) {
     return mod_id;
 } 
 
+std::string dirname(const std::string& path) {
+    auto dir = sl::utils::strip_filename(path);
+    if (!dir.empty()) { // remote last slash
+        dir.resize(dir.length() - 1);
+    }
+    return dir;
+}
+
+JSValue create_arg_val(JSContext* ctx, const sl::json::value& ar) {
+    switch(ar.json_type()) {
+    case sl::json::type::nullt:
+        return JS_NULL;
+    case sl::json::type::string:
+        return JS_NewString(ctx, ar.as_string().c_str());
+    case sl::json::type::integer:
+        return JS_NewInt64(ctx, ar.as_int64());
+    case sl::json::type::boolean:
+        return JS_NewBool(ctx, ar.as_bool());
+    default:
+        throw support::exception(TRACEMSG("Invalid callback script argument specified," +
+                " type: [" + sl::json::stringify_json_type(ar.json_type()) + "],"
+                " only string, integer or boolean arguments can be passed to ES module callbacks"));
+    }
+}
+
 JSModuleDef* module_loader(JSContext *ctx, const char* module_name, void* /* opaque */) {
     auto path = std::string(module_name);
     if (!(sl::utils::starts_with(path, "file://") || sl::utils::starts_with(path, "zip://"))) {
         auto prefix = wilton_config_json()["requireJs"]["baseUrl"].as_string_nonempty_or_throw("baseUrl");
         path = prefix + "/" + path;
+        if (!sl::utils::ends_with(path, ".js")) {
+            path.append("/esm.js");
+        }
     }
     try {
         // load code
@@ -302,9 +330,11 @@ JSModuleDef* module_loader(JSContext *ctx, const char* module_name, void* /* opa
         auto deferred_meta = sl::support::defer([ctx, meta] () STATICLIB_NOEXCEPT {
             JS_FreeValue(ctx, meta);
         });
-        JS_DefinePropertyValueStr(ctx, meta, "url", JS_NewStringLen(ctx, path.c_str(), path.length()), JS_PROP_C_W_E);
         auto mod_id = module_id(path, module_name);
-        JS_DefinePropertyValueStr(ctx, meta, "id", JS_NewStringLen(ctx, mod_id.c_str(), path.length()), JS_PROP_C_W_E);
+        auto mod_dir = dirname(path);
+        JS_DefinePropertyValueStr(ctx, meta, "id", JS_NewStringLen(ctx, mod_id.c_str(), mod_id.length()), JS_PROP_C_W_E);
+        JS_DefinePropertyValueStr(ctx, meta, "url", JS_NewStringLen(ctx, path.c_str(), path.length()), JS_PROP_C_W_E);
+        JS_DefinePropertyValueStr(ctx, meta, "dir", JS_NewStringLen(ctx, mod_dir.c_str(), mod_dir.length()), JS_PROP_C_W_E);
         JS_DefinePropertyValueStr(ctx, meta, "args", JS_NewArray(ctx), JS_PROP_C_W_E);
 
         return mod;
@@ -374,23 +404,18 @@ JSValueConst run_es_module(JSContext* ctx, const sl::json::value& cb_json_obj) {
     auto deferred_meta = sl::support::defer([ctx, meta] () STATICLIB_NOEXCEPT {
         JS_FreeValue(ctx, meta);
     });
-    JS_DefinePropertyValueStr(ctx, meta, "url", JS_NewStringLen(ctx, path.c_str(), path.length()), JS_PROP_C_W_E);
     auto mod_id = module_id(path, path);
-    JS_DefinePropertyValueStr(ctx, meta, "id", JS_NewStringLen(ctx, mod_id.c_str(), path.length()), JS_PROP_C_W_E);
+    auto mod_dir = dirname(path);
+    JS_DefinePropertyValueStr(ctx, meta, "id", JS_NewStringLen(ctx, mod_id.c_str(), mod_id.length()), JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, meta, "url", JS_NewStringLen(ctx, path.c_str(), path.length()), JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, meta, "dir", JS_NewStringLen(ctx, mod_dir.c_str(), mod_dir.length()), JS_PROP_C_W_E);
     JSValue args = JS_NewArray(ctx);
     if (JS_IsException(args)) {
         throw support::exception(TRACEMSG("'JS_NewArray' error"));
     }
     auto& args_json = cb_json_obj["args"].as_array();
     for (uint32_t i = 0; i < args_json.size(); i++) {
-        auto& ar = args_json[i];
-        if (sl::json::type::string != ar.json_type() && sl::json::type::nullt != ar.json_type()) {
-            throw support::exception(TRACEMSG("Invalid callback script argument specified," +
-                    " type: [" + sl::json::stringify_json_type(ar.json_type()) + "],"
-                    " only string arguments can be passed to ES module callbacks"));
-        }
-        auto& val = ar.as_string();
-        JSValue el = JS_NewStringLen(ctx, val.c_str(), val.length());
+        JSValue el = create_arg_val(ctx, args_json[i]);
         auto ret = JS_DefinePropertyValueUint32(ctx, args, i, el, JS_PROP_C_W_E);
         if (ret < 0) {
             JS_FreeValue(ctx, args);
